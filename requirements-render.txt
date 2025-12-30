@@ -1,0 +1,46 @@
+# Core
+fastapi==0.110.1
+uvicorn==0.25.0
+starlette==0.37.2
+
+# Database
+motor==3.3.1
+pymongo==4.5.0
+
+# Authentication
+bcrypt==4.1.3
+PyJWT==2.10.1
+passlib==1.7.4
+python-jose==3.5.0
+
+# WebSocket / Socket.IO
+python-socketio==5.16.0
+python-engineio==4.13.0
+simple-websocket==1.1.0
+
+# Data Validation
+pydantic==2.12.5
+pydantic_core==2.41.5
+email-validator==2.3.0
+annotated-types==0.7.0
+
+# HTTP / Networking
+httpx==0.28.1
+httpcore==1.0.9
+requests==2.32.5
+certifi==2025.11.12
+
+# OpenAI for AI questions
+openai==2.14.0
+
+# Utilities
+python-dotenv==1.2.1
+python-multipart==0.0.21
+
+# Async
+anyio==4.12.0
+sniffio==1.3.1
+h11==0.16.0
+
+# DNS for MongoDB Atlas
+dnspython==2.8.0
