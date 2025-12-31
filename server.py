@@ -397,6 +397,10 @@ async def create_room(data: RoomCreate, user: dict = Depends(get_current_user)):
     }
     
     await db.rooms.insert_one(room)
+    
+    # Broadcast to all clients that a new room is available
+    await sio.emit('rooms:updated', {"action": "created", "room": room})
+    
     return RoomResponse(**room)
 
 @api_router.post("/rooms/{room_id}/join", response_model=RoomResponse)
@@ -429,6 +433,13 @@ async def join_room(room_id: str, user: dict = Depends(get_current_user)):
     )
     
     room = await db.rooms.find_one({"id": room_id})
+    
+    # Broadcast room update to all users in the room
+    await sio.emit('room:updated', room, room=room_id)
+    
+    # Also broadcast that rooms list changed
+    await sio.emit('rooms:updated', {"action": "player_joined", "room": room})
+    
     return RoomResponse(**room)
 
 @api_router.post("/rooms/{room_id}/leave")
@@ -641,14 +652,22 @@ async def room_join(sid, data):
     user_id = session.get('user_id') if session else None
     
     if not user_id or not room_id:
+        logger.warning(f"room_join failed: user_id={user_id}, room_id={room_id}")
         return
     
+    # Join the Socket.IO room
     await sio.enter_room(sid, room_id)
     user_rooms[sid] = room_id
     
+    logger.info(f"User {user_id} joined socket room {room_id}")
+    
+    # Get updated room from database and broadcast to all in room
     room = await db.rooms.find_one({"id": room_id})
     if room:
+        # Remove _id for JSON serialization
+        room.pop('_id', None)
         await sio.emit('room:updated', room, room=room_id)
+        logger.info(f"Broadcasted room update to room {room_id}")
 
 @sio.event
 async def room_leave(sid, data):
@@ -672,7 +691,10 @@ async def room_ready(sid, data):
     user_id = session.get('user_id') if session else None
     
     if not user_id or not room_id:
+        logger.warning(f"room_ready failed: user_id={user_id}, room_id={room_id}")
         return
+    
+    logger.info(f"User {user_id} setting ready={ready} in room {room_id}")
     
     await db.rooms.update_one(
         {"id": room_id, "players.id": user_id},
@@ -681,7 +703,10 @@ async def room_ready(sid, data):
     
     room = await db.rooms.find_one({"id": room_id})
     if room:
+        # Remove _id for JSON serialization
+        room.pop('_id', None)
         await sio.emit('room:updated', room, room=room_id)
+        logger.info(f"Broadcasted ready state update to room {room_id}")
 
 @sio.event
 async def game_start(sid, data):
@@ -689,14 +714,24 @@ async def game_start(sid, data):
     session = await sio.get_session(sid)
     user_id = session.get('user_id') if session else None
     
+    logger.info(f"game_start called by user {user_id} for room {room_id}")
+    
     if not room_id:
+        logger.warning("game_start: no room_id provided")
         return
     
     room = await db.rooms.find_one({"id": room_id})
-    if not room or room["host_id"] != user_id:
+    if not room:
+        logger.warning(f"game_start: room {room_id} not found")
+        return
+        
+    if room["host_id"] != user_id:
+        logger.warning(f"game_start: user {user_id} is not host of room {room_id}")
+        await sio.emit('error', {"message": "Sadece oda kurucusu oyunu başlatabilir"}, to=sid)
         return
     
     if len(room["players"]) < 2:
+        logger.warning(f"game_start: not enough players in room {room_id}")
         await sio.emit('error', {"message": "En az 2 oyuncu gerekli"}, to=sid)
         return
     
@@ -706,9 +741,11 @@ async def game_start(sid, data):
     ]).to_list(room["question_count"])
     
     if len(questions) < room["question_count"]:
-        # Generate questions if not enough
+        logger.warning(f"game_start: not enough questions for room {room_id}")
         await sio.emit('error', {"message": "Yeterli soru yok"}, to=sid)
         return
+    
+    logger.info(f"Starting game in room {room_id} with {len(questions)} questions")
     
     # Update room status
     await db.rooms.update_one(
