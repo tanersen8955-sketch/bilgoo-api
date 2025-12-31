@@ -398,8 +398,14 @@ async def create_room(data: RoomCreate, user: dict = Depends(get_current_user)):
     
     await db.rooms.insert_one(room)
     
+    # Remove _id for JSON serialization before broadcast
+    room.pop('_id', None)
+    
     # Broadcast to all clients that a new room is available
-    await sio.emit('rooms:updated', {"action": "created", "room": room})
+    try:
+        await sio.emit('rooms:updated', {"action": "created", "room": room})
+    except Exception as e:
+        logger.error(f"Error broadcasting room creation: {e}")
     
     return RoomResponse(**room)
 
@@ -434,11 +440,15 @@ async def join_room(room_id: str, user: dict = Depends(get_current_user)):
     
     room = await db.rooms.find_one({"id": room_id})
     
-    # Broadcast room update to all users in the room
-    await sio.emit('room:updated', room, room=room_id)
+    # Remove _id for JSON serialization
+    room.pop('_id', None)
     
-    # Also broadcast that rooms list changed
-    await sio.emit('rooms:updated', {"action": "player_joined", "room": room})
+    # Broadcast room update to all users in the room
+    try:
+        await sio.emit('room:updated', room, room=room_id)
+        await sio.emit('rooms:updated', {"action": "player_joined", "room": room})
+    except Exception as e:
+        logger.error(f"Error broadcasting room join: {e}")
     
     return RoomResponse(**room)
 
