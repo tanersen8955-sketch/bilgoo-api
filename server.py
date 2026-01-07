@@ -781,11 +781,25 @@ async def game_answer(sid, data):
     session = await sio.get_session(sid)
     user_id = session.get('user_id') if session else None
     
+    logger.info(f"game_answer: user {user_id} answered {answer} in room {room_id}")
+    
     if not user_id or room_id not in active_games:
+        logger.warning(f"game_answer: invalid user_id or room not active")
         return
     
     game = active_games[room_id]
+    
+    # Check if already revealing (prevent late answers)
+    if game.get("revealing"):
+        logger.warning(f"game_answer: answer rejected, already revealing")
+        return
+    
     if user_id in game["players"]:
+        # Check if player already answered
+        if game["players"][user_id]["answer"] is not None:
+            logger.warning(f"game_answer: user {user_id} already answered")
+            return
+        
         game["players"][user_id]["answer"] = answer
         
         # Update database
@@ -794,14 +808,19 @@ async def game_answer(sid, data):
             {"$set": {"players.$.current_answer": answer}}
         )
         
+        logger.info(f"Answer recorded for user {user_id}")
+        
         # Check if all players answered
         all_answered = all(p["answer"] is not None for p in game["players"].values())
-        if all_answered and game.get("timer_task"):
-            game["timer_task"].cancel()
+        if all_answered:
+            logger.info(f"All players answered in room {room_id}, revealing early")
+            if game.get("timer_task") and not game["timer_task"].done():
+                game["timer_task"].cancel()
             await reveal_answer(room_id)
 
 async def send_question(room_id: str):
     if room_id not in active_games:
+        logger.warning(f"send_question: room {room_id} not in active_games")
         return
     
     game = active_games[room_id]
@@ -812,10 +831,22 @@ async def send_question(room_id: str):
         await end_game(room_id)
         return
     
+    # Cancel any existing timer before starting new one
+    if game.get("timer_task") and not game["timer_task"].done():
+        game["timer_task"].cancel()
+        try:
+            await game["timer_task"]
+        except asyncio.CancelledError:
+            pass
+    
     question = questions[index]
     room = await db.rooms.find_one({"id": room_id})
     
-    # Reset answers
+    if not room:
+        logger.warning(f"send_question: room {room_id} not found in database")
+        return
+    
+    # Reset answers for all players
     for player_id in game["players"]:
         game["players"][player_id]["answer"] = None
     
@@ -823,6 +854,8 @@ async def send_question(room_id: str):
         {"id": room_id},
         {"$set": {"players.$[].current_answer": None}}
     )
+    
+    logger.info(f"Sending question {index + 1}/{len(questions)} to room {room_id}")
     
     game_state = {
         "room_id": room_id,
@@ -857,40 +890,69 @@ async def send_question(room_id: str):
     game["timer_task"] = asyncio.create_task(question_timer(room_id))
 
 async def question_timer(room_id: str):
+    """Timer for each question - counts down from 20 to 0"""
     try:
         for remaining in range(19, -1, -1):
             await asyncio.sleep(1)
+            
+            # Check if game still exists
             if room_id not in active_games:
+                logger.info(f"Timer stopped: room {room_id} no longer active")
                 return
+            
+            # Emit timer update
             await sio.emit('game:timer', remaining, room=room_id)
         
+        # Time's up - reveal answer
+        logger.info(f"Timer finished for room {room_id}, revealing answer")
         await reveal_answer(room_id)
+        
     except asyncio.CancelledError:
-        pass
+        logger.info(f"Timer cancelled for room {room_id}")
+    except Exception as e:
+        logger.error(f"Timer error for room {room_id}: {e}")
 
 async def reveal_answer(room_id: str):
     if room_id not in active_games:
+        logger.warning(f"reveal_answer: room {room_id} not in active_games")
         return
     
     game = active_games[room_id]
+    
+    # Prevent multiple reveals
+    if game.get("revealing"):
+        logger.warning(f"reveal_answer: already revealing for room {room_id}")
+        return
+    game["revealing"] = True
+    
     questions = game["questions"]
     index = game["current_index"]
     question = questions[index]
     correct = question["correct_answer"]
     
     room = await db.rooms.find_one({"id": room_id})
+    if not room:
+        logger.warning(f"reveal_answer: room {room_id} not found")
+        game["revealing"] = False
+        return
+    
+    logger.info(f"Revealing answer for question {index + 1} in room {room_id}, correct: {correct}")
     
     # Calculate scores
     for player_id, player_data in game["players"].items():
         answer = player_data["answer"]
         if answer == correct:
             player_data["score"] += 5
+            logger.info(f"Player {player_id} answered correctly, +5 points")
         elif answer is not None:
             player_data["score"] -= 3
             if player_data["score"] < 0:
                 player_data["score"] = 0
+            logger.info(f"Player {player_id} answered wrong, -3 points")
+        else:
+            logger.info(f"Player {player_id} did not answer")
     
-    # Update room scores
+    # Update room scores in database
     for player in room["players"]:
         new_score = game["players"].get(player["id"], {}).get("score", 0)
         await db.rooms.update_one(
@@ -918,7 +980,8 @@ async def reveal_answer(room_id: str):
     # Wait before next question
     await asyncio.sleep(3)
     
-    # Move to next question
+    # Reset revealing flag and move to next question
+    game["revealing"] = False
     game["current_index"] += 1
     await send_question(room_id)
 
