@@ -609,12 +609,13 @@ async def add_question(data: QuestionCreate, user: dict = Depends(get_admin_user
 @api_router.post("/questions/generate", response_model=List[QuestionResponse])
 async def generate_ai_questions(data: GenerateQuestionsRequest, user: dict = Depends(get_admin_user)):
     """Admin only - Generate questions using AI"""
+    import httpx
+    import json as json_lib
+    
+    if not EMERGENT_LLM_KEY:
+        raise HTTPException(status_code=500, detail="AI anahtarı yapılandırılmamış")
+    
     try:
-        client = OpenAI(
-            api_key=EMERGENT_LLM_KEY,
-            base_url="https://api.emergentagi.com/v1"
-        )
-        
         prompt = f"""Generate {data.count} multiple choice trivia questions in Turkish for the category "{data.category}".
 
 Each question must have:
@@ -634,25 +635,39 @@ Return as JSON array with this exact format:
 Make sure questions are diverse, interesting, and factually correct.
 Only return the JSON array, nothing else."""
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a trivia question generator. Always respond with valid JSON only."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.8,
-            max_tokens=2000
-        )
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                "https://api.emergentagi.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {EMERGENT_LLM_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                        {"role": "system", "content": "You are a trivia question generator. Always respond with valid JSON only."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.8,
+                    "max_tokens": 2000
+                }
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"AI API error: {response.status_code} - {response.text}")
+                raise HTTPException(status_code=500, detail=f"AI servisi hatası: {response.status_code}")
+            
+            result = response.json()
+            content = result["choices"][0]["message"]["content"].strip()
         
-        import json
-        content = response.choices[0].message.content.strip()
         # Clean potential markdown code blocks
         if content.startswith("```"):
             content = content.split("```")[1]
             if content.startswith("json"):
                 content = content[4:]
+        content = content.strip()
         
-        questions_data = json.loads(content)
+        questions_data = json_lib.loads(content)
         
         generated_questions = []
         for q in questions_data:
@@ -670,11 +685,18 @@ Only return the JSON array, nothing else."""
             await db.questions.insert_one(question)
             generated_questions.append(QuestionResponse(**question))
         
+        logger.info(f"Generated {len(generated_questions)} AI questions for category {data.category}")
         return generated_questions
         
+    except httpx.RequestError as e:
+        logger.error(f"AI connection error: {e}")
+        raise HTTPException(status_code=500, detail=f"AI bağlantı hatası: {str(e)}")
+    except json_lib.JSONDecodeError as e:
+        logger.error(f"AI response parse error: {e}")
+        raise HTTPException(status_code=500, detail="AI yanıtı işlenemedi")
     except Exception as e:
         logger.error(f"AI question generation error: {e}")
-        raise HTTPException(status_code=500, detail=f"Soru uretimi basarisiz: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Soru üretimi başarısız: {str(e)}")
 
 # =========================
 # Leaderboard Endpoints
