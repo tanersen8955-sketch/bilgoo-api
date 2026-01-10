@@ -745,6 +745,13 @@ async def game_start(sid, data):
         await sio.emit('error', {"message": "En az 2 oyuncu gerekli"}, to=sid)
         return
     
+    # Check if all players are ready
+    all_ready = all(p.get("is_ready", False) for p in room["players"])
+    if not all_ready:
+        logger.warning(f"game_start: not all players ready in room {room_id}")
+        await sio.emit('error', {"message": "Tüm oyuncular hazır değil"}, to=sid)
+        return
+    
     # Get random questions
     questions = await db.questions.aggregate([
         {"$sample": {"size": room["question_count"]}}
