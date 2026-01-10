@@ -280,6 +280,82 @@ async def get_profile(user: dict = Depends(get_current_user)):
         created_at=user["created_at"]
     )
 
+# Google OAuth endpoint
+class GoogleAuthData(BaseModel):
+    id: str
+    email: str
+    name: str
+    picture: Optional[str] = None
+    session_token: Optional[str] = None
+
+@api_router.post("/auth/google", response_model=AuthResponse)
+async def google_auth(data: GoogleAuthData):
+    """Handle Google OAuth login/registration"""
+    # Check if user exists by email
+    user = await db.users.find_one({"email": data.email})
+    
+    if user:
+        # User exists, update and login
+        is_admin = data.email in ADMIN_EMAILS
+        await db.users.update_one(
+            {"email": data.email},
+            {"$set": {"google_id": data.id, "is_admin": is_admin}}
+        )
+        token = create_token(user["id"])
+        return AuthResponse(
+            access_token=token,
+            user=UserResponse(
+                id=user["id"],
+                username=user["username"],
+                email=user["email"],
+                score=user["score"],
+                friends=user.get("friends", []),
+                avatar_color=user["avatar_color"],
+                is_admin=is_admin,
+                created_at=user["created_at"]
+            )
+        )
+    else:
+        # New user, create account
+        user_id = str(uuid.uuid4())
+        is_admin = data.email in ADMIN_EMAILS
+        username = data.name.replace(" ", "").lower()[:15] or data.email.split("@")[0]
+        
+        # Check if username exists and make unique
+        existing = await db.users.find_one({"username": username})
+        if existing:
+            username = f"{username}{random.randint(100, 999)}"
+        
+        new_user = {
+            "id": user_id,
+            "username": username,
+            "email": data.email,
+            "google_id": data.id,
+            "password_hash": "",  # No password for Google users
+            "score": 0,
+            "friends": [],
+            "avatar_color": random.choice(AVATAR_COLORS),
+            "is_admin": is_admin,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        await db.users.insert_one(new_user)
+        
+        token = create_token(user_id)
+        return AuthResponse(
+            access_token=token,
+            user=UserResponse(
+                id=new_user["id"],
+                username=new_user["username"],
+                email=new_user["email"],
+                score=new_user["score"],
+                friends=new_user["friends"],
+                avatar_color=new_user["avatar_color"],
+                is_admin=is_admin,
+                created_at=new_user["created_at"]
+            )
+        )
+
 # =========================
 # Friends Endpoints
 # =========================
