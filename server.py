@@ -611,6 +611,7 @@ async def generate_ai_questions(data: GenerateQuestionsRequest, user: dict = Dep
     """Admin only - Generate questions using AI"""
     import httpx
     import json as json_lib
+    import ssl
     
     if not EMERGENT_LLM_KEY:
         raise HTTPException(status_code=500, detail="AI anahtarı yapılandırılmamış")
@@ -635,7 +636,12 @@ Return as JSON array with this exact format:
 Make sure questions are diverse, interesting, and factually correct.
 Only return the JSON array, nothing else."""
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        # Create SSL context that's more permissive
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
             response = await client.post(
                 "https://api.emergentagi.com/v1/chat/completions",
                 headers={
