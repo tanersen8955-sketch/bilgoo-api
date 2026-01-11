@@ -87,7 +87,7 @@ class UserCreate(BaseModel):
     password: str = Field(..., min_length=6)
 
 class UserLogin(BaseModel):
-    email: EmailStr
+    email_or_username: str  # Can be email or username
     password: str
 
 class UserResponse(BaseModel):
@@ -151,6 +151,13 @@ class QuestionResponse(BaseModel):
 class GenerateQuestionsRequest(BaseModel):
     category: str
     count: int = Field(default=5, ge=1, le=20)
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str = Field(..., min_length=6)
 
 # =========================
 # Helper Functions
@@ -247,9 +254,21 @@ async def register(data: UserCreate):
 
 @api_router.post("/auth/login", response_model=AuthResponse)
 async def login(data: UserLogin):
-    user = await db.users.find_one({"email": data.email})
+    # Try to find user by email or username
+    identifier = data.email_or_username.strip()
+    
+    # Check if it looks like an email
+    if '@' in identifier:
+        user = await db.users.find_one({"email": identifier.lower()})
+    else:
+        # Try username (case-insensitive)
+        user = await db.users.find_one({"username": {"$regex": f"^{identifier}$", "$options": "i"}})
+        if not user:
+            # Also try email just in case
+            user = await db.users.find_one({"email": identifier.lower()})
+    
     if not user or not verify_password(data.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Geçersiz e-posta veya şifre")
+        raise HTTPException(status_code=401, detail="Geçersiz e-posta/kullanıcı adı veya şifre")
     
     is_admin = user.get("email", "") in ADMIN_EMAILS
     token = create_token(user["id"])
@@ -355,6 +374,65 @@ async def google_auth(data: GoogleAuthData):
                 created_at=new_user["created_at"]
             )
         )
+
+# Forgot Password endpoint
+@api_router.post("/auth/forgot-password")
+async def forgot_password(data: ForgotPasswordRequest):
+    """Send password reset email"""
+    user = await db.users.find_one({"email": data.email.lower()})
+    
+    # Always return success to prevent email enumeration
+    if not user:
+        return {"message": "Eğer bu e-posta kayıtlıysa, şifre sıfırlama bağlantısı gönderildi."}
+    
+    # Check if user is a Google-only account
+    if user.get("google_id") and not user.get("password_hash"):
+        return {"message": "Bu hesap Google ile oluşturulmuş. Lütfen Google ile giriş yapın."}
+    
+    # Generate reset token (valid for 1 hour)
+    reset_token = str(uuid.uuid4())
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    
+    # Store reset token in database
+    await db.password_resets.delete_many({"user_id": user["id"]})  # Remove old tokens
+    await db.password_resets.insert_one({
+        "user_id": user["id"],
+        "token": reset_token,
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    
+    # TODO: Send email with reset link
+    # For now, log the token (in production, integrate with email service)
+    logger.info(f"Password reset token for {data.email}: {reset_token}")
+    
+    return {"message": "Eğer bu e-posta kayıtlıysa, şifre sıfırlama bağlantısı gönderildi."}
+
+@api_router.post("/auth/reset-password")
+async def reset_password(data: ResetPasswordRequest):
+    """Reset password using token"""
+    reset_record = await db.password_resets.find_one({"token": data.token})
+    
+    if not reset_record:
+        raise HTTPException(status_code=400, detail="Geçersiz veya süresi dolmuş token")
+    
+    # Check if token expired
+    expires_at = datetime.fromisoformat(reset_record["expires_at"])
+    if datetime.now(timezone.utc) > expires_at:
+        await db.password_resets.delete_one({"token": data.token})
+        raise HTTPException(status_code=400, detail="Token süresi dolmuş. Lütfen tekrar deneyin.")
+    
+    # Update password
+    new_hash = hash_password(data.new_password)
+    await db.users.update_one(
+        {"id": reset_record["user_id"]},
+        {"$set": {"password_hash": new_hash}}
+    )
+    
+    # Delete the used token
+    await db.password_resets.delete_one({"token": data.token})
+    
+    return {"message": "Şifreniz başarıyla güncellendi. Giriş yapabilirsiniz."}
 
 # =========================
 # Friends Endpoints
@@ -856,10 +934,32 @@ async def game_start(sid, data):
         await sio.emit('error', {"message": "Tüm oyuncular hazır değil"}, to=sid)
         return
     
-    # Get random questions
-    questions = await db.questions.aggregate([
-        {"$sample": {"size": room["question_count"]}}
-    ]).to_list(room["question_count"])
+    # Get IDs of questions already answered by these players
+    player_ids = [p["id"] for p in room["players"]]
+    answered_question_ids = set()
+    
+    for pid in player_ids:
+        user_data = await db.users.find_one({"id": pid})
+        if user_data and "answered_questions" in user_data:
+            answered_question_ids.update(user_data["answered_questions"])
+    
+    # Get random questions excluding already answered ones
+    pipeline = []
+    if answered_question_ids:
+        pipeline.append({"$match": {"id": {"$nin": list(answered_question_ids)}}})
+    pipeline.append({"$sample": {"size": room["question_count"]}})
+    
+    questions = await db.questions.aggregate(pipeline).to_list(room["question_count"])
+    
+    # If not enough new questions, include some answered ones
+    if len(questions) < room["question_count"]:
+        remaining = room["question_count"] - len(questions)
+        existing_ids = [q["id"] for q in questions]
+        additional = await db.questions.aggregate([
+            {"$match": {"id": {"$nin": existing_ids}}},
+            {"$sample": {"size": remaining}}
+        ]).to_list(remaining)
+        questions.extend(additional)
     
     if len(questions) < room["question_count"]:
         logger.warning(f"game_start: not enough questions for room {room_id}")
@@ -1103,12 +1203,18 @@ async def end_game(room_id: str):
     game = active_games[room_id]
     room = await db.rooms.find_one({"id": room_id})
     
-    # Update user scores in database
+    # Get question IDs from this game
+    question_ids = [q["id"] for q in game["questions"]]
+    
+    # Update user scores in database and mark questions as answered
     for player in room["players"]:
         player_score = game["players"].get(player["id"], {}).get("score", 0)
         await db.users.update_one(
             {"id": player["id"]},
-            {"$inc": {"score": player_score}}
+            {
+                "$inc": {"score": player_score},
+                "$addToSet": {"answered_questions": {"$each": question_ids}}
+            }
         )
     
     # Mark room as finished
